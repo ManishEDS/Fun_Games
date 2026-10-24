@@ -41,6 +41,7 @@ Run:      python bluff.py
 import json
 import math
 import random
+import secrets
 import sys
 import time
 from collections import Counter
@@ -85,7 +86,7 @@ def _ensure_pyqt5():
 _ensure_pyqt5()
 
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt5.QtCore import QPointF, QRectF, Qt, QSettings, QTimer
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
     QPolygonF, QRadialGradient, QTransform,
@@ -2251,7 +2252,9 @@ def send_json(sock, msg):
 
 
 class HostController:
-    """Hosts the game. Holds the only copy of every hand and sends each friend a private view."""
+    """Hosts the game and preserves disconnected seats briefly for token-based recovery."""
+
+    RECONNECT_GRACE_MS = 90_000
 
     def __init__(self, players, decks, classic, name=""):
         self.go_menu = False
@@ -2259,9 +2262,11 @@ class HostController:
         self.closing = False
         self.players = players
         self.engine = Engine([name or "Host"] + [None] * (players - 1), decks, classic)
-        self.socks = {}                  # seat -> socket
+        self.socks = {}                  # seat -> active socket
         self.seat_of = {}                # socket -> seat
         self.joined = {0}                # seats whose player has introduced themselves
+        self.session_tokens = {seat: secrets.token_urlsafe(32) for seat in range(1, players)}
+        self.reconnect_timers = {}
         self.window = BluffWindow(self, players, 0, decks, classic, "over_only", "Host")
         self.server = QTcpServer()
         if not self.server.listen(QHostAddress.Any, PORT):
@@ -2279,29 +2284,70 @@ class HostController:
         self.window.show()
 
     # ---------- network ----------
+    def _wire_socket(self, sock):
+        sock.readyRead.connect(lambda s=sock: self._read(s))
+        sock.disconnected.connect(lambda s=sock: self._dropped(s))
+
     def _on_new_connection(self):
         while self.server.hasPendingConnections():
             sock = self.server.nextPendingConnection()
-            free = [s for s in range(1, self.players) if s not in self.socks]
-            if self.engine.phase != "lobby" or not free:
-                send_json(sock, {"type": "error", "msg": "This game is full or already started."})
+            if self.engine.phase == "lobby":
+                free = [s for s in range(1, self.players) if s not in self.socks]
+                if not free:
+                    send_json(sock, {"type": "error", "msg": "This game is full."})
+                    sock.disconnectFromHost()
+                    continue
+                seat = free[0]
+                # A newly assigned player must not inherit a stale reconnect token.
+                self.session_tokens[seat] = secrets.token_urlsafe(32)
+                self.socks[seat] = sock
+                self.seat_of[sock] = seat
+            elif self.engine.phase == "play":
+                # During a match, the client must prove its session token before
+                # it can be assigned to a disconnected seat.
+                pass
+            else:
+                send_json(sock, {"type": "error", "msg": "This game has ended. Ask the host to start a new game."})
                 sock.disconnectFromHost()
                 continue
-            seat = free[0]
-            self.socks[seat] = sock
-            self.seat_of[sock] = seat
-            sock.readyRead.connect(lambda s=sock: self._read(s))
-            sock.disconnected.connect(lambda s=sock: self._dropped(s))
+            self._wire_socket(sock)
 
     def _read(self, sock):
         for msg in read_lines(sock):
             self._handle(sock, msg)
 
+    def _reconnect(self, sock, msg):
+        token = msg.get("token")
+        if not isinstance(token, str) or not token:
+            return False
+        seat = next((s for s, expected in self.session_tokens.items()
+                     if secrets.compare_digest(token, expected)), None)
+        if seat is None or seat in self.socks or seat not in self.joined:
+            return False
+        timer = self.reconnect_timers.pop(seat, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        self.socks[seat] = sock
+        self.seat_of[sock] = seat
+        send_json(sock, {"type": "welcome", "index": seat, "n": self.players,
+                         "decks": self.engine.decks, "classic": self.engine.classic,
+                         "token": self.session_tokens[seat], "reconnected": True})
+        self._notify_clients(f"{self.engine.names[seat]} reconnected.")
+        self.sync()
+        return True
+
     def _handle(self, sock, msg):
-        seat = self.seat_of.get(sock)
-        if seat is None:
+        if not isinstance(msg, dict):
             return
         t = msg.get("type")
+        seat = self.seat_of.get(sock)
+        if seat is None:
+            if t == "hello" and self.engine.phase == "play":
+                if not self._reconnect(sock, msg):
+                    send_json(sock, {"type": "error", "msg": "Reconnect token is invalid or the recovery period has expired."})
+                    sock.disconnectFromHost()
+            return
         if t == "hello" and seat not in self.joined and self.engine.phase == "lobby":
             name = str(msg.get("name", "")).strip()[:14] or f"Player {seat + 1}"
             taken = {n.lower() for n in self.engine.names if n} | {"you", WAITING.lower()}
@@ -2310,9 +2356,10 @@ class HostController:
             self.engine.names[seat] = name
             self.joined.add(seat)
             send_json(sock, {"type": "welcome", "index": seat, "n": self.players,
-                             "decks": self.engine.decks, "classic": self.engine.classic})
+                             "decks": self.engine.decks, "classic": self.engine.classic,
+                             "token": self.session_tokens[seat], "reconnected": False})
             if len(self.joined) == self.players:
-                self.engine.deal()               # everyone is here: shuffle and deal
+                self.engine.deal()
             self.sync()
         elif seat in self.joined and self.engine.phase == "play":
             err = None
@@ -2326,6 +2373,8 @@ class HostController:
                 return
             if err is None:
                 self.sync()
+            else:
+                send_json(sock, {"type": "action_error", "msg": str(err)})
 
     def _dropped(self, sock):
         if self.closing:
@@ -2333,15 +2382,40 @@ class HostController:
         seat = self.seat_of.pop(sock, None)
         if seat is None:
             return
-        self.socks.pop(seat, None)
+        if self.socks.get(seat) is sock:
+            self.socks.pop(seat, None)
         name = self.engine.names[seat] or f"Player {seat + 1}"
-        was_joined = seat in self.joined
-        self.joined.discard(seat)
-        self.engine.names[seat] = None
-        if self.engine.phase == "play":
-            self.engine.abort(f"{name} left the game.")
-        if was_joined or self.engine.phase != "play":
+        if self.engine.phase == "play" and seat in self.joined:
+            old_timer = self.reconnect_timers.pop(seat, None)
+            if old_timer is not None:
+                old_timer.stop()
+                old_timer.deleteLater()
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda s=seat: self._reconnect_expired(s))
+            self.reconnect_timers[seat] = timer
+            timer.start(self.RECONNECT_GRACE_MS)
+            self._notify_clients(f"{name} disconnected. Waiting up to 90 seconds for reconnection.")
             self.sync()
+        else:
+            self.joined.discard(seat)
+            self.engine.names[seat] = None
+            self.sync()
+
+    def _reconnect_expired(self, seat):
+        self.reconnect_timers.pop(seat, None)
+        if self.closing or seat in self.socks or self.engine.phase != "play":
+            return
+        name = self.engine.names[seat] or f"Player {seat + 1}"
+        self.engine.abort(f"{name} did not reconnect within 90 seconds. The game was aborted.")
+        self._notify_clients(f"{name} did not reconnect in time. The match has ended.")
+        self.sync()
+
+    def _notify_clients(self, message):
+        for sock in list(self.socks.values()):
+            send_json(sock, {"type": "notice", "msg": message})
+        if hasattr(self.window, "show_notice"):
+            self.window.show_notice(message)
 
     def sync(self):
         self.window.set_view(self.engine.view_for(0))
@@ -2363,21 +2437,39 @@ class HostController:
             self.sync()
 
     def new_game(self):
-        if len(self.joined) == self.players:
+        all_connected = all(s in self.joined and s in self.socks for s in range(1, self.players))
+        if all_connected:
+            for timer in self.reconnect_timers.values():
+                timer.stop()
+                timer.deleteLater()
+            self.reconnect_timers.clear()
             self.engine.deal()
-        else:                                    # someone left: wait for a replacement
+        else:
             self.engine.reset()
+            # Keep connected players in their seats; free disconnected seats for replacements.
+            self.joined = {0} | {seat for seat in range(1, self.players)
+                                  if seat in self.socks and seat in self.joined}
+            for seat in range(1, self.players):
+                if seat not in self.socks:
+                    self.engine.names[seat] = None
         self.sync()
 
     def shutdown(self):
         self.closing = True
+        for timer in self.reconnect_timers.values():
+            timer.stop()
+            timer.deleteLater()
+        self.reconnect_timers.clear()
         for sock in list(self.socks.values()):
             sock.abort()
         self.server.close()
 
 
 class ClientController:
-    """Joins a friend's game. Only ever receives its own private view."""
+    """Joins a hosted game and retries a dropped connection during the recovery window."""
+
+    RECONNECT_GRACE_SECONDS = 90
+    RETRY_INTERVAL_MS = 2_000
 
     def __init__(self, ip, name):
         self.go_menu = False
@@ -2385,21 +2477,36 @@ class ClientController:
         self.closing = False
         self.window = None
         self.name = name
+        self.ip = ip.strip()
+        self.settings = QSettings("Bluff3D", "Bluff")
+        self.token_key = "reconnect_tokens/" + self.ip
+        self.session_token = self.settings.value(self.token_key, "", type=str)
+        self.reconnect_deadline = None
+        self.reconnect_timer = QTimer()
+        self.reconnect_timer.setSingleShot(True)
+        self.reconnect_timer.timeout.connect(self._retry_reconnect)
         self.sock = QTcpSocket()
-        self.sock.connected.connect(lambda: send_json(self.sock, {"type": "hello", "name": self.name}))
+        self.sock.connected.connect(self._send_hello)
         self.sock.readyRead.connect(self._read)
         self.sock.disconnected.connect(self._disconnected)
         err = getattr(self.sock, "errorOccurred", None) or self.sock.error
         err.connect(self._on_error)
-        self.sock.connectToHost(ip, PORT)
+        self.sock.connectToHost(self.ip, PORT)
 
     def start(self):
         pass                                    # the window appears once the host welcomes us
+
+    def _send_hello(self):
+        msg = {"type": "hello", "name": self.name}
+        if self.session_token:
+            msg["token"] = self.session_token
+        send_json(self.sock, msg)
 
     def _fail(self, text):
         if self.closing:
             return
         self.closing = True
+        self.reconnect_timer.stop()
         self.go_menu = True
         QMessageBox.critical(None, "Bluff", text)
         if self.window is not None:
@@ -2407,33 +2514,70 @@ class ClientController:
         QApplication.quit()
 
     def _on_error(self, *_):
-        if self.window is None:
+        if self.closing:
+            return
+        if self.window is None and self.reconnect_deadline is None:
             self._fail("Could not connect to the host. Check the IP, and that the host has "
-                       "already pressed Host Game.")
+                        "already pressed Host Game.")
+        elif self.reconnect_deadline is not None:
+            self._schedule_retry()
 
     def _disconnected(self):
         if self.closing:
             return
         if self.window is None:
-            self._fail("Connection lost.")
-        else:
-            self.window.show_notice("Disconnected from the host.")
+            self._fail("Connection lost before joining the game.")
+            return
+        if not self.session_token:
+            self.window.show_notice("Disconnected from the host. Reconnection is unavailable.")
+            return
+        if self.reconnect_deadline is None:
+            self.reconnect_deadline = time.monotonic() + self.RECONNECT_GRACE_SECONDS
+        self.window.show_notice("Connection lost. Trying to reconnect for up to 90 seconds…")
+        self._schedule_retry()
+
+    def _schedule_retry(self):
+        if self.closing or self.reconnect_deadline is None:
+            return
+        remaining = self.reconnect_deadline - time.monotonic()
+        if remaining <= 0:
+            self._fail("Could not reconnect within 90 seconds. The host may have ended the match.")
+            return
+        if self.sock.state() == QAbstractSocket.UnconnectedState:
+            self.sock.connectToHost(self.ip, PORT)
+        self.reconnect_timer.start(min(self.RETRY_INTERVAL_MS, max(100, int(remaining * 1000))))
+
+    def _retry_reconnect(self):
+        self._schedule_retry()
 
     def _read(self):
         for msg in read_lines(self.sock):
             t = msg.get("type")
-            if t == "welcome" and self.window is None:
-                self.window = BluffWindow(self, int(msg["n"]), int(msg["index"]), int(msg["decks"]),
-                                          bool(msg["classic"]), "never", "Guest")
-                self.window.lobby_hint = "The host deals as soon as everyone has joined."
-                self.window.show()
+            if t == "welcome":
+                token = msg.get("token")
+                if isinstance(token, str) and token:
+                    self.session_token = token
+                    self.settings.setValue(self.token_key, token)
+                if self.window is None:
+                    self.window = BluffWindow(self, int(msg["n"]), int(msg["index"]), int(msg["decks"]),
+                                              bool(msg["classic"]), "never", "Guest")
+                    self.window.lobby_hint = "The host deals as soon as everyone has joined."
+                    self.window.show()
+                if self.reconnect_deadline is not None:
+                    self.reconnect_deadline = None
+                    self.reconnect_timer.stop()
+                    self.window.show_notice("Reconnected. Your seat and hand have been restored.")
             elif t == "view" and self.window is not None:
                 self.window.set_view(msg["view"])
+            elif t == "notice" and self.window is not None:
+                self.window.show_notice(str(msg.get("msg", "")))
+            elif t == "action_error" and self.window is not None:
+                self.window.show_notice(str(msg.get("msg", "Action rejected.")))
             elif t == "error":
                 self._fail(str(msg.get("msg", "Error.")))
                 return
 
-    # ---------- your actions are only requests; the host decides ----------
+    # ---------- your own actions are only requests; the host decides ----------
     def play(self, cards, claim):
         send_json(self.sock, {"type": "play", "cards": [list(c) for c in cards], "claim": claim})
 
@@ -2448,6 +2592,7 @@ class ClientController:
 
     def shutdown(self):
         self.closing = True
+        self.reconnect_timer.stop()
         self.sock.abort()
 
 
